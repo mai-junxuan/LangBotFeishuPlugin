@@ -13,7 +13,7 @@ except ImportError:
 
 from pkg.platform.sources.lark import LarkAdapter
 from pkg.plugin.context import register, handler, BasePlugin, APIHost, EventContext
-from pkg.plugin.events import NormalMessageResponded
+from pkg.plugin.events import NormalMessageResponded, NormalMessageRespondedEnd
 import pkg.platform.types.message as platform_message
 
 
@@ -223,3 +223,92 @@ class MdImgTail(BasePlugin):
 
         # 更新响应文本
         ctx.add_return('reply', new_content)
+
+    # 回复全部完成时触发
+    @handler(NormalMessageRespondedEnd)
+    async def on_responded_end(self, ctx: EventContext):
+        """回复全部完成时触发
+
+        在 Feishu 流式消息模式下，发送最终的内容更新以确保完整性
+
+        @author maijunxuan @date 2025-07-08
+        """
+        self.host.ap.logger.info(f"[MdImgTail] Response ended: {ctx.event.response_text}")
+
+        # 只处理飞书平台
+        if not isinstance(ctx.event.query.adapter, LarkAdapter):
+            return
+
+        reply_mode = ctx.event.query.adapter.config.get('reply_mode', 'normal')
+        if not reply_mode == 'stream_message':
+            return
+
+        try:
+            # 从messagechain中获取消息ID
+            message_id = ctx.event.query.message_event.message_chain.message_id
+
+            if not message_id:
+                self.ap.logger.warning("[MdImgTail] 无法从messagechain获取消息ID，跳过流式结束处理")
+                return
+
+            adapter = ctx.event.query.adapter
+
+            # 检查是否有对应的卡片ID
+            if message_id not in adapter.message_id_to_card_id:
+                self.ap.logger.info("[MdImgTail] 未找到对应的卡片ID，可能不是流式消息")
+                return
+
+            # 设置卡片流式模式为 false
+            import uuid
+            import json
+            from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
+
+            card_id = adapter.message_id_to_card_id[message_id]
+            current_sequence = adapter.message_id_to_sequence.get(message_id, 1)
+
+            # 构造流式配置，将 streaming_mode 设置为 false
+            streaming_config = {
+                "config": {
+                    "streaming_config": {
+                        "print_frequency_ms": {
+                            "android": 70,
+                            "default": 70,
+                            "ios": 70,
+                            "pc": 70
+                        },
+                        "print_step": {
+                            "android": 1,
+                            "default": 1,
+                            "ios": 1,
+                            "pc": 1
+                        },
+                        "print_strategy": "fast"
+                    },
+                    "streaming_mode": False  # 设置为 false 来结束流式模式
+                }
+            }
+
+            # 构造设置请求
+            settings_request = SettingsCardRequest.builder() \
+                .card_id(card_id) \
+                .request_body(SettingsCardRequestBody.builder()
+                    .settings(json.dumps(streaming_config))
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(current_sequence)
+                    .build()) \
+                .build()
+
+            # 发送设置请求来关闭流式模式
+            response = await adapter.api_client.cardkit.v1.card.asettings(settings_request)
+
+            if response.success():
+                self.ap.logger.info("[MdImgTail] 流式消息结束，已设置 streaming_mode=false")
+            else:
+                self.ap.logger.warning(f"[MdImgTail] 设置 streaming_mode=false 失败: {response.code}, {response.msg}")
+
+            # 更新序列号缓存
+            if message_id in adapter.message_id_to_sequence:
+                adapter.message_id_to_sequence[message_id] += 1
+
+        except Exception as e:
+            self.ap.logger.error(f"[MdImgTail] 流式消息结束处理出错: {str(e)}")
